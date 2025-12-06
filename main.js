@@ -1,3 +1,7 @@
+// main.js
+// Procedural datacenter with optimized render loop, shadows, better micro-geometry, and
+// additional slacked cables running from scaffolding to backs of server blades.
+
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
@@ -60,9 +64,14 @@ const GEO = {};
 
 // Scene globals
 let scene, camera, renderer, controls, composer, clock;
+let bloomPass;
 let MATERIALS = {};
 const racks = [];
 const leds = [];
+
+// Small optimization: skip LED updates some frames on very heavy scenes
+const LED_UPDATE_INTERVAL = 1 / 90; // seconds
+let ledAccumulator = 0;
 
 // -----------------------------------------------------
 // Init
@@ -87,11 +96,16 @@ function init() {
   // Renderer
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // limit for perf
   renderer.physicallyCorrectLights = true;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.2;
+  renderer.toneMappingExposure = 1.15;
+
+  // Shadows
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
   document.body.appendChild(renderer.domElement);
 
   // Controls
@@ -112,7 +126,7 @@ function init() {
   createLights();
   createRacks();
   createScaffolding();
-  createCables();
+  createCables(); // includes rack-to-rack, rack-to-scaffold, and scaffold-to-blades
   setupPostProcessing();
 
   window.addEventListener('resize', onWindowResize);
@@ -153,6 +167,12 @@ function createMaterials() {
     metalness: 0.1
   });
 
+  const thinCable = new THREE.MeshStandardMaterial({
+    color: 0x181818,
+    roughness: 0.9,
+    metalness: 0.1
+  });
+
   const floor = new THREE.MeshStandardMaterial({
     color: 0x050505,
     roughness: 0.4,
@@ -177,6 +197,7 @@ function createMaterials() {
     bladeDark,
     bladeDetailLight,
     cable,
+    thinCable,
     floor,
     wall,
     scaffold,
@@ -227,22 +248,25 @@ function createEnvironment() {
 
   const wallFront = new THREE.Mesh(wallGeomX, MATERIALS.wall);
   wallFront.position.set(0, wallHeight / 2, -floorSizeZ / 2);
-  // normal +Z
+  wallFront.receiveShadow = true;
   scene.add(wallFront);
 
   const wallBack = new THREE.Mesh(wallGeomX, MATERIALS.wall);
   wallBack.position.set(0, wallHeight / 2, floorSizeZ / 2);
   wallBack.rotation.y = Math.PI;
+  wallBack.receiveShadow = true;
   scene.add(wallBack);
 
   const wallLeft = new THREE.Mesh(wallGeomZ, MATERIALS.wall);
   wallLeft.position.set(-floorSizeX / 2, wallHeight / 2, 0);
   wallLeft.rotation.y = Math.PI / 2;
+  wallLeft.receiveShadow = true;
   scene.add(wallLeft);
 
   const wallRight = new THREE.Mesh(wallGeomZ, MATERIALS.wall);
   wallRight.position.set(floorSizeX / 2, wallHeight / 2, 0);
   wallRight.rotation.y = -Math.PI / 2;
+  wallRight.receiveShadow = true;
   scene.add(wallRight);
 
   // HDRI environment for reflections / indirect light
@@ -285,8 +309,11 @@ function createLights() {
     const x = THREE.MathUtils.lerp(-halfSpanX, halfSpanX, t);
     const y = CONFIG.scaffoldHeight + 0.3;
 
-    const light = new THREE.PointLight(lightColor, 20, 15); // physicallyCorrectLights: small-ish intensity
+    const light = new THREE.PointLight(lightColor, 18, 14);
     light.position.set(x, y, aisleZ);
+    light.castShadow = true;
+    light.shadow.mapSize.set(512, 512);
+    light.shadow.bias = -0.0004;
     scene.add(light);
   }
 }
@@ -361,11 +388,15 @@ function createRack(rowIndex, indexInRow, position, rotationY) {
   for (const pos of postPositions) {
     const post = new THREE.Mesh(GEO.rackPost, MATERIALS.rackFrame);
     post.position.copy(pos);
+    post.castShadow = true;
+    post.receiveShadow = true;
     frameGroup.add(post);
   }
 
   const top = new THREE.Mesh(GEO.rackTop, MATERIALS.rackFrame);
   top.position.set(0, rackHeight - 0.025, 0);
+  top.castShadow = true;
+  top.receiveShadow = true;
   frameGroup.add(top);
 
   rack.add(frameGroup);
@@ -425,18 +456,29 @@ function createRackBlades(rack) {
 /**
  * Create a single blade with:
  * - base chassis
- * - front micro features (vents, drive bays, handle, labels)
+ * - front micro features (vents, drive bays, handle, labels),
+ *   protruding slightly to avoid z-fighting
  * - LED array
+ * - back connector anchor for cable routing
  */
 function createBlade() {
   const group = new THREE.Group();
 
   const chassis = new THREE.Mesh(GEO.blade, MATERIALS.blade);
+  chassis.castShadow = true;
+  chassis.receiveShadow = true;
   group.add(chassis);
 
-  // Front micro-details live in this group, positioned at the front face
+  // Back connector (for cables from scaffolding to blade backside)
+  const backConnector = new THREE.Object3D();
+  backConnector.position.set(0, 0, CONFIG.bladeDepth / 2);
+  group.add(backConnector);
+  group.userData.backConnector = backConnector;
+
+  // Front micro-details live in this group, positioned slightly in front of chassis
   const frontGroup = new THREE.Group();
-  frontGroup.position.z = -CONFIG.bladeDepth / 2;
+  // Push forward ~2mm to avoid z-fighting with chassis front face
+  frontGroup.position.z = -CONFIG.bladeDepth / 2 - 0.002;
 
   // Vents: thin slats across the front
   const numVents = 4;
@@ -446,6 +488,7 @@ function createBlade() {
   for (let i = 0; i < numVents; i++) {
     const vent = new THREE.Mesh(GEO.vent, MATERIALS.bladeDark);
     vent.position.set(0, ventsStartY + i * ventSpacing, VENT_DEPTH / 2);
+    vent.castShadow = true;
     frontGroup.add(vent);
   }
 
@@ -460,6 +503,7 @@ function createBlade() {
       drivesY,
       DRIVE_D / 2
     );
+    drive.castShadow = true;
     frontGroup.add(drive);
   }
 
@@ -470,6 +514,7 @@ function createBlade() {
     0,
     HANDLE_D / 2
   );
+  handle.castShadow = true;
   frontGroup.add(handle);
 
   // Tiny button / label near top-right
@@ -479,6 +524,7 @@ function createBlade() {
     CONFIG.bladeHeight / 4,
     BUTTON_D / 2
   );
+  button.castShadow = true;
   frontGroup.add(button);
 
   // LED array
@@ -490,11 +536,11 @@ function createBlade() {
 }
 
 /**
- * Create 2–4 LEDs on the blade's front and register them in a global array
+ * Create 2–3 LEDs on the blade's front and register them in a global array
  * for animation.
  */
 function createBladeLEDs(parentFrontGroup) {
-  const numLEDs = 2 + Math.floor(Math.random() * 3); // 2–4
+  const numLEDs = 2 + Math.floor(Math.random() * 2); // 2–3 for perf
   const ledSpacing = 0.006;
   const startY = -0.015;
   const x = CONFIG.bladeWidth / 2 - 0.045;
@@ -514,7 +560,8 @@ function createBladeLEDs(parentFrontGroup) {
     });
 
     const led = new THREE.Mesh(GEO.led, ledMaterial);
-    led.position.set(x, startY + i * ledSpacing, LED_SIZE / 2 + 0.001);
+    led.position.set(x, startY + i * ledSpacing, LED_SIZE / 2 + 0.002);
+    led.castShadow = false;
     parentFrontGroup.add(led);
 
     // Store animation metadata
@@ -578,6 +625,8 @@ function createScaffolding() {
     const beamGeom = new THREE.BoxGeometry(length, thickness, thickness);
     const beam = new THREE.Mesh(beamGeom, MATERIALS.scaffold);
     beam.position.set((xMin + xMax) / 2, height, zBack);
+    beam.castShadow = true;
+    beam.receiveShadow = true;
     scene.add(beam);
   });
 
@@ -594,17 +643,20 @@ function createScaffolding() {
     for (let x = globalXMin - 0.5; x <= globalXMax + 0.5; x += spacing) {
       const cross = new THREE.Mesh(crossGeom, MATERIALS.scaffold);
       cross.position.set(x, height, zMid);
+      cross.castShadow = true;
+      cross.receiveShadow = true;
       scene.add(cross);
     }
   }
 }
 
 // -----------------------------------------------------
-// Cables (back-to-back & rack-to-overhead)
+// Cables (back-to-back, rack-to-overhead, scaffold-to-blades)
 // -----------------------------------------------------
 
 function createCables() {
   const cableMaterial = MATERIALS.cable;
+  const thinCableMaterial = MATERIALS.thinCable;
 
   // Group racks by row for back-to-back cabling
   const rows = {};
@@ -629,7 +681,7 @@ function createCables() {
       rackA.userData.backAnchor.getWorldPosition(p1);
       rackB.userData.backAnchor.getWorldPosition(p2);
 
-      const cablesBetween = 2 + Math.floor(Math.random() * 3); // 2–4
+      const cablesBetween = 2; // keep low for performance
 
       for (let c = 0; c < cablesBetween; c++) {
         const offsetY = (c - (cablesBetween - 1) / 2) * 0.03;
@@ -641,18 +693,18 @@ function createCables() {
 
         const mid = p1c.clone().add(p2c).multiplyScalar(0.5);
         // Sag
-        mid.y -= THREE.MathUtils.randFloat(0.2, 0.4);
+        mid.y -= THREE.MathUtils.randFloat(0.2, 0.35);
         // Tiny lateral jitter
         mid.x += (Math.random() - 0.5) * 0.05;
         mid.z += (Math.random() - 0.5) * 0.05;
 
         const points = [p1c, mid, p2c];
-        createCable(points, cableMaterial);
+        createCable(points, cableMaterial, { minRadius: 0.014, maxRadius: 0.018 });
       }
     }
   });
 
-  // Rack-to-overhead cables
+  // Rack-to-overhead trunk cables
   const pRack = new THREE.Vector3();
   const pOver = new THREE.Vector3();
 
@@ -660,37 +712,81 @@ function createCables() {
     rack.userData.backAnchor.getWorldPosition(pRack);
     rack.userData.overheadAnchor.getWorldPosition(pOver);
 
-    const cablesCount = 1 + Math.floor(Math.random() * 2); // 1–2 per rack
+    const cablesCount = 1; // trunk cable per rack
 
     for (let i = 0; i < cablesCount; i++) {
       const p1 = pRack.clone();
 
       const p2 = pRack.clone();
-      p2.y += 0.5 + Math.random() * 0.3;
+      p2.y += 0.6 + Math.random() * 0.3;
 
       const mid = p2.clone().lerp(pOver, 0.5);
-      mid.x += (Math.random() - 0.5) * 0.3;
-      mid.z += (Math.random() - 0.5) * 0.3;
-      mid.y -= THREE.MathUtils.randFloat(0.1, 0.2); // slight slack
+      mid.x += (Math.random() - 0.5) * 0.25;
+      mid.z += (Math.random() - 0.5) * 0.25;
+      mid.y -= THREE.MathUtils.randFloat(0.1, 0.25); // slight slack
 
       const p4 = pOver.clone();
-      p4.x += (Math.random() - 0.5) * 0.2;
-      p4.z += (Math.random() - 0.5) * 0.2;
+      p4.x += (Math.random() - 0.5) * 0.15;
+      p4.z += (Math.random() - 0.5) * 0.15;
 
       const points = [p1, p2, mid, p4];
-      createCable(points, cableMaterial);
+      createCable(points, cableMaterial, { minRadius: 0.012, maxRadius: 0.016 });
+    }
+  }
+
+  // Scaffolding-to-blade cables (slacked data cables to backs of server blades)
+  const pBlade = new THREE.Vector3();
+  const pScaffold = new THREE.Vector3();
+
+  for (const rack of racks) {
+    const bladesGroup = rack.userData.bladesGroup;
+    const blades = bladesGroup.children;
+    if (!blades.length) continue;
+
+    // Get overhead anchor world pos once per rack
+    rack.userData.overheadAnchor.getWorldPosition(pScaffold);
+
+    // Choose a subset of blades per rack
+    const bladesToWire = Math.min(4, blades.length);
+    const chosenIndices = new Set();
+    while (chosenIndices.size < bladesToWire) {
+      chosenIndices.add(Math.floor(Math.random() * blades.length));
+    }
+
+    for (const idx of chosenIndices) {
+      const blade = blades[idx];
+      const backConnector = blade.userData.backConnector;
+      if (!backConnector) continue;
+
+      backConnector.getWorldPosition(pBlade);
+
+      // Cable path: scaffold -> downward slack -> towards blade -> blade back
+      const p1 = pScaffold.clone();
+      const p4 = pBlade.clone();
+
+      const p2 = p1.clone();
+      p2.y -= THREE.MathUtils.randFloat(0.25, 0.45);
+
+      const mid = p1.clone().lerp(p4, 0.5);
+      mid.y -= THREE.MathUtils.randFloat(0.15, 0.3); // sag
+      mid.x += (Math.random() - 0.5) * 0.1;
+      mid.z += (Math.random() - 0.5) * 0.1;
+
+      const points = [p1, p2, mid, p4];
+      createCable(points, thinCableMaterial, { minRadius: 0.007, maxRadius: 0.01 });
     }
   }
 }
 
-function createCable(points, material) {
+function createCable(points, material, { minRadius, maxRadius }) {
   const curve = new THREE.CatmullRomCurve3(points);
   curve.curveType = 'catmullrom';
   curve.tension = 0.5;
 
-  const tubularSegments = 32;
-  const radius = THREE.MathUtils.randFloat(0.012, 0.02);
-  const radialSegments = 8;
+  // Slightly reduced segments for better performance
+  const tubularSegments = 18;
+  const radius = THREE.MathUtils.randFloat(minRadius, maxRadius);
+  const radialSegments = 6;
 
   const geometry = new THREE.TubeGeometry(
     curve,
@@ -700,6 +796,8 @@ function createCable(points, material) {
     false
   );
   const mesh = new THREE.Mesh(geometry, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = false;
   scene.add(mesh);
 }
 
@@ -708,16 +806,24 @@ function createCable(points, material) {
 // -----------------------------------------------------
 
 function setupPostProcessing() {
-  const size = new THREE.Vector2(window.innerWidth, window.innerHeight);
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+
   composer = new EffectComposer(renderer);
 
   const renderPass = new RenderPass(scene, camera);
   composer.addPass(renderPass);
 
-  const bloomPass = new UnrealBloomPass(size, 1.7, 0.4, 0.15);
-  bloomPass.threshold = 0.15;
-  bloomPass.strength = 1.7;
-  bloomPass.radius = 0.35;
+  // Use smaller internal resolution for bloom to keep things lighter
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(width / 2, height / 2),
+    1.6,
+    0.4,
+    0.16
+  );
+  bloomPass.threshold = 0.16;
+  bloomPass.strength = 1.6;
+  bloomPass.radius = 0.32;
   composer.addPass(bloomPass);
 }
 
@@ -728,8 +834,15 @@ function setupPostProcessing() {
 function animate() {
   requestAnimationFrame(animate);
 
-  const elapsed = clock.getElapsedTime();
-  updateLEDs(elapsed);
+  const delta = clock.getDelta();
+  const elapsed = clock.elapsedTime;
+
+  // Throttled LED updates for performance
+  ledAccumulator += delta;
+  if (ledAccumulator >= LED_UPDATE_INTERVAL) {
+    updateLEDs(elapsed);
+    ledAccumulator = 0;
+  }
 
   controls.update();
   composer.render();
@@ -760,7 +873,8 @@ function updateLEDs(time) {
       const noise =
         0.5 +
         0.5 * Math.sin(time * blinkFrequency * 3.7 + phaseOffset * 1.3);
-      intensity = minIntensity + (maxIntensity - minIntensity) * Math.abs(s) * noise;
+      intensity =
+        minIntensity + (maxIntensity - minIntensity) * Math.abs(s) * noise;
     }
 
     material.emissiveIntensity = intensity;
@@ -779,7 +893,9 @@ function onWindowResize() {
   camera.updateProjectionMatrix();
 
   renderer.setSize(width, height);
-  if (composer) {
-    composer.setSize(width, height);
+  composer.setSize(width, height);
+
+  if (bloomPass) {
+    bloomPass.setSize(width / 2, height / 2);
   }
 }
