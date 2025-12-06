@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Procedural Three.js Datacenter</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #050509;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #ccc;
+    }
+
+    #overlay {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 8px 12px;
+      background: rgba(0, 0, 0, 0.55);
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.4;
+      pointer-events: none;
+    }
+  </style>
+
+  <!-- Import map for Three.js and its addons -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
